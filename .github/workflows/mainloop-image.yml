@@ -1,0 +1,74 @@
+# Mainloop fork: build the stock Dockerfile (slim, linux/amd64 — the k8s TEST nodes are amd64) of a PINNED upstream release and push it to
+# ghcr.io/mainloop-ai/hermes-agent:<release>-<commit>. Release branches are `mainloop/vX.Y.Z` = the upstream tag + this file only.
+# The deployment (mainloop-k8s-platform apps/hermes-agent) pins the digest from the run summary. Upstream's own workflows are disabled in this fork.
+name: mainloop-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["mainloop/v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mainloop-image-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Release from the branch name
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          case "$REF" in mainloop/v[0-9]*) ;; *) echo "build only mainloop/vX.Y.Z branches" >&2; exit 1 ;; esac
+          echo "RELEASE=${REF#mainloop/}" >> "$GITHUB_ENV"
+          echo "SHORT=${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Write install stamp
+        run: |
+          python3 scripts/write_install_stamp.py --output install-stamp.json \
+            --distribution docker --update-mechanism external --source ci --commit "$GITHUB_SHA" \
+            --base-version "${RELEASE#v}" --display-version "${RELEASE#v}" --distance 0
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            HERMES_BOT_DESKTOP=0
+          tags: ghcr.io/mainloop-ai/hermes-agent:${{ env.RELEASE }}-${{ env.SHORT }}
+          cache-from: type=gha,scope=mainloop-amd64
+          cache-to: type=gha,mode=max,scope=mainloop-amd64
+
+      - name: Digest to pin
+        run: echo "ghcr.io/mainloop-ai/hermes-agent:${RELEASE}-${SHORT}@${{ steps.build.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"
